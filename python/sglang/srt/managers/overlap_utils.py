@@ -88,13 +88,14 @@ class Relayer:
             self._verify_bufs_initialized = False
             self._draft_extend_bufs_initialized = False
 
-        # Two events split the spec V2 forward into verify and draft_extend
-        # phases. Recorded on forward stream by the respective store_post_*
-        # call; resolve_draft_input_for_handoff waits them per-field on
-        # schedule stream so schedule prep / .cpu().item() can overlap with
-        # draft_extend.
+        # Recorded on forward stream by store_post_verify; awaited on
+        # schedule stream in resolve_draft_input_for_handoff so
+        # batch.seq_lens.cpu().item() in next iter's prepare_for_decode can
+        # overlap with the draft_extend that follows on forward stream.
+        # No event for draft_extend outputs: their channel views are
+        # consumed only on forward stream (resolve_future at next forward,
+        # same stream as the producer), so same-stream ordering suffices.
         self._event_post_verify: Optional[torch.cuda.Event] = None
-        self._event_post_draft_extend: Optional[torch.cuda.Event] = None
 
     def _lazy_init_verify_bufs(self, draft_input: EagleDraftInput):
         self._verify_bufs_initialized = True
@@ -206,6 +207,9 @@ class Relayer:
     def store_post_draft_extend(
         self, handle: RelayerHandle, draft_input: EagleDraftInput
     ):
+        """Writes draft-extend outputs to channel. No event needed: the
+        channel views are consumed on forward stream at next iter's
+        resolve_future, same stream as this write."""
         intv = handle.interval
         if self.is_empty_slice(intv):
             return
@@ -215,17 +219,15 @@ class Relayer:
         self.topk_index_buf[intv] = draft_input.topk_index
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
-        event = torch.get_device_module(self.device).Event()
-        event.record()
-        self._event_post_draft_extend = event
 
     def resolve_draft_input_for_handoff(
         self, handle: RelayerHandle, draft_input: EagleDraftInput
     ):
-        """Rebind draft_input fields to channel slot views on the consumer
-        (schedule) stream. Verify outputs only wait event_post_verify so
-        .cpu()/.item() on new_seq_lens unblocks before draft_extend finishes;
-        draft-extend outputs wait the later event.
+        """Rebind new_seq_lens to its channel slot on the consumer (schedule)
+        stream, waiting event_post_verify. Other fields (bonus_tokens /
+        topk_p / topk_index / hidden_states) are consumed only on forward
+        stream — resolve_future at next forward rebinds them in-place there
+        (same stream as the producer, no event needed).
         """
         if handle is None or draft_input is None:
             return
@@ -242,13 +244,6 @@ class Relayer:
         if self._event_post_verify is not None:
             self._event_post_verify.wait(stream)
         draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
-        draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
-        if self._event_post_draft_extend is not None:
-            self._event_post_draft_extend.wait(stream)
-        draft_input.topk_p = self.topk_p_buf[indices]
-        draft_input.topk_index = self.topk_index_buf[indices]
-        if spec_need_hidden_states():
-            draft_input.hidden_states = self.hidden_states_buf[indices]
 
     def apply_outputs(
         self,
