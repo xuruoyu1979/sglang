@@ -187,3 +187,17 @@ class FutureMap:
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
+
+    def handoff_to_next_iter(
+        self,
+        batch: ScheduleBatch,
+        future_indices: FutureIndices,
+        batch_result: GenerationBatchResult,
+    ) -> None:
+        """Install spec V2 worker output onto SB for next iter's scheduling
+        prep. Caller guards spec V2.
+        """
+        draft_input: EagleDraftInput = batch_result.next_draft_input
+        batch.spec_info = draft_input
+        batch.spec_info.future_indices = future_indices
+        batch.seq_lens = draft_input.new_seq_lens
