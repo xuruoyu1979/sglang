@@ -80,6 +80,12 @@ class FutureMap:
             # This is to make the shape derivation easier.
             self.buf_initialized = False
 
+        # Producer event for spec V2 forward outputs. Recorded by
+        # store_to_map_for_new_batch on the producer (forward) stream;
+        # waited on by resolve_draft_input_for_handoff on the consumer
+        # (schedule) stream. Replaces the global verify_done barrier.
+        self._spec_v2_producer_event: Optional[torch.cuda.Event] = None
+
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
 
@@ -188,6 +194,45 @@ class FutureMap:
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
 
+        # Record producer event on the current (forward) stream after the
+        # buf writes. Consumers wait this event before reading channel views.
+        event = torch.get_device_module(self.device).Event()
+        event.record()
+        self._spec_v2_producer_event = event
+
+    def _wait_spec_v2_producer(
+        self, consumer_stream: Optional[torch.cuda.Stream] = None
+    ):
+        event = self._spec_v2_producer_event
+        if event is None:
+            return
+        if consumer_stream is None:
+            consumer_stream = torch.get_device_module(self.device).current_stream()
+        event.wait(consumer_stream)
+
+    def resolve_draft_input_for_handoff(self, draft_input: EagleDraftInput):
+        """Rebind a spec V2 draft input's tensor fields to channel slot views
+        on the consumer (schedule) stream. The cross-stream sync against the
+        forward-stream producer is folded into the wait here, so downstream
+        SB.seq_lens / SB.spec_info reads on the schedule stream are properly
+        ordered without a global verify_done barrier.
+        """
+        if draft_input is None or draft_input.future_indices is None:
+            return
+        indices = draft_input.future_indices.indices
+        # Idle / bs=0 batch: producer side (store_to_map_for_new_batch) skipped
+        # the write on the empty interval and did not record an event for the
+        # newly alloc'd slot. Worker-side idle tensors stay attached.
+        if indices.numel() == 0:
+            return
+        self._wait_spec_v2_producer()
+        draft_input.topk_p = self.topk_p_buf[indices]
+        draft_input.topk_index = self.topk_index_buf[indices]
+        draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
+        draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+        if spec_need_hidden_states():
+            draft_input.hidden_states = self.hidden_states_buf[indices]
+
     def handoff_to_next_iter(
         self,
         batch: ScheduleBatch,
@@ -195,16 +240,23 @@ class FutureMap:
         batch_result: GenerationBatchResult,
     ) -> None:
         """Install this iter's worker output onto SB for next iter's
-        scheduling prep. The output tensors are still being resolved on the
-        forward stream; resolve_future will fill in the real values later.
+        scheduling prep.
 
-        - output_ids: negated future indices as placeholder.
-        - spec V2: also rebind spec_info + seq_lens to future-map-backed
-          tensors.
+        - output_ids: negated future indices as placeholder; resolve_future
+          fills in real tokens later on the forward stream.
+        - spec V2: eagerly resolve draft_input tensor fields to channel slot
+          views (with the producer event.wait folded in), then install
+          spec_info + seq_lens. Channel views are channel-buf backed so SB no
+          longer aliases a worker-stream raw tensor.
         """
         batch.output_ids = -future_indices.indices
         if batch.is_spec_v2:
             draft_input: EagleDraftInput = batch_result.next_draft_input
+            draft_input.future_indices = future_indices
+            # Eager resolve on the schedule stream: rebind draft_input fields
+            # from worker-stream raw tensors to channel slot views, folding in
+            # the cross-stream wait. After this, SB.seq_lens / SB.spec_info
+            # refs are channel-backed (persistent buf, properly ordered).
+            self.resolve_draft_input_for_handoff(draft_input)
             batch.spec_info = draft_input
-            batch.spec_info.future_indices = future_indices
             batch.seq_lens = draft_input.new_seq_lens
