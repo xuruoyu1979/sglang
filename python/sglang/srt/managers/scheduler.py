@@ -2891,7 +2891,8 @@ class Scheduler(
                 self.relayer.apply_outputs(batch, handle, batch_result)
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                if batch_result.next_token_ids is not None:
+                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -2901,7 +2902,9 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                # PP intermediate ranks return next_token_ids=None.
+                if batch_result.next_token_ids is not None:
+                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
