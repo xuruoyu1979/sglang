@@ -693,6 +693,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
             )
+            # Mirror verify()'s store_post_verify: prefill has no separate
+            # verify phase but the new_seq_lens / bonus_tokens channels still
+            # need to be populated (resolve_draft_input_for_handoff reads
+            # new_seq_lens_buf right after).
+            if self.relayer is not None and batch.relayer_handle is not None:
+                self.relayer.store_post_verify(
+                    batch.relayer_handle, batch_output.next_draft_input
+                )
             return batch_output
         else:
             if batch.spec_info is None:
