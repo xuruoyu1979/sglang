@@ -137,12 +137,11 @@ class Relayer:
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.token_ids_buf)
         else:
-            # TODO(lsyin): write relayer handle into spec_info.relayer_handle
             draft_input: EagleDraftInput = batch.spec_info
-            if draft_input is None:
+            if draft_input is None or batch.relayer_handle is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
-            indices = draft_input.relayer_handle.indices
+            indices = batch.relayer_handle.indices
             # The indices tensor was allocated on the default stream but is
             # used here on the forward stream. Meanwhile, the old spec_info
             # holding this tensor will lose all Python references (replaced at
@@ -206,27 +205,30 @@ class Relayer:
             consumer_stream = torch.get_device_module(self.device).current_stream()
         event.wait(consumer_stream)
 
-    def resolve_draft_input_for_handoff(self, draft_input: EagleDraftInput):
+    def resolve_draft_input_for_handoff(
+        self, handle: RelayerHandle, draft_input: EagleDraftInput
+    ):
         """Rebind a spec V2 draft input's tensor fields to channel slot views
         on the consumer (schedule) stream. The cross-stream sync against the
         forward-stream producer is folded into the wait here, so downstream
         SB.seq_lens / SB.spec_info reads on the schedule stream are properly
         ordered without a global verify_done barrier.
         """
-        if draft_input is None or draft_input.relayer_handle is None:
+        if handle is None or draft_input is None:
             return
-        indices = draft_input.relayer_handle.indices
+        indices = handle.indices
         # Idle / bs=0 batch: producer side (store_for_new_batch) skipped the
         # write on the empty interval and did not record an event for the
         # newly alloc'd slot. Worker-side idle tensors stay attached.
         if indices.numel() == 0:
             return
         self._wait_spec_v2_producer()
-        # The old spec_info holding `indices` loses its only Python ref when
-        # caller does `batch.spec_info = draft_input` after this returns; the
-        # caching allocator could reclaim the memory before the GPU finishes
-        # reading it on the current stream. Defer reclaim via record_stream
-        # until the RelayerHandle becomes a Relayer-owned ref (future work).
+        # The old SB.relayer_handle holding `indices` loses its only Python
+        # ref when caller does `batch.relayer_handle = handle` after this
+        # returns; the caching allocator could reclaim the memory before the
+        # GPU finishes reading it on the current stream. Defer reclaim via
+        # record_stream until the RelayerHandle becomes a Relayer-owned ref
+        # (future work).
         indices.record_stream(torch.get_device_module(self.device).current_stream())
         draft_input.topk_p = self.topk_p_buf[indices]
         draft_input.topk_index = self.topk_index_buf[indices]
@@ -265,8 +267,8 @@ class Relayer:
         buffers; the cross-stream wait is folded into resolve_draft_input_for_handoff
         so any subsequent SB-side read carries the producer event.wait inline.
         """
+        batch.relayer_handle = handle
         draft_input: EagleDraftInput = batch_result.next_draft_input
-        draft_input.relayer_handle = handle
-        self.resolve_draft_input_for_handoff(draft_input)
+        self.resolve_draft_input_for_handoff(handle, draft_input)
         batch.spec_info = draft_input
         batch.seq_lens = draft_input.new_seq_lens

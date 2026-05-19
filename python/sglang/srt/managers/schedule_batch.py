@@ -96,6 +96,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.overlap_utils import RelayerHandle
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -1488,6 +1489,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+    # Cross-iter relay handle for spec V2 overlap (slot in Relayer's channel
+    # buffers). Set by apply_spec_v2_relay_outputs; None for non-spec / spec V1.
+    relayer_handle: Optional[RelayerHandle] = None
 
     # Whether to return hidden states
     return_hidden_states: bool = False
@@ -2474,7 +2478,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # - Only for decode batch (running_batch)
         has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
 
-        if self.spec_info:
+        if self.relayer_handle is not None:
+            # Spec V2 overlap: handle indices are the canonical state; spec_info
+            # tensor fields are channel views that will refresh next iter via
+            # resolve_future, so skip spec_info.filter_batch.
+            self.relayer_handle.indices = self.relayer_handle.indices[
+                keep_indices_device
+            ]
+        elif self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
                 has_been_filtered=has_been_filtered,
@@ -2522,7 +2533,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
-        if self.spec_info:
+        if self.relayer_handle is not None:
+            # Spec V2 overlap: concat handle indices; spec_info tensor fields
+            # are channel views that will refresh next iter via resolve_future.
+            from sglang.srt.managers.overlap_utils import RelayerHandle
+
+            assert other.relayer_handle is not None
+            self.relayer_handle = RelayerHandle(
+                indices=torch.cat(
+                    [self.relayer_handle.indices, other.relayer_handle.indices]
+                )
+            )
+        elif self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
     def copy(self):
