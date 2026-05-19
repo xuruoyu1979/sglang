@@ -1299,11 +1299,14 @@ class Scheduler(
             self.relayer = None
             return
 
-        self.relayer = self.spec_algorithm.create_relayer(
+        from sglang.srt.managers.overlap_utils import Relayer
+
+        self.relayer = Relayer(
             self.max_running_requests,
             self.chunked_prefill_size,
             self.model_config.context_len,
             self.device,
+            self.spec_algorithm,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
