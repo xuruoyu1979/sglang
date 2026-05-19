@@ -2903,14 +2903,7 @@ class Scheduler(
                         else:
                             batch_result.relayer_handle = handle
 
-                self.relayer.handoff_to_next_iter(batch, handle)
-
-                # Delay-sample defers store() to launch_batch_sample_if_needed,
-                # which then applies the spec V2 outputs.
-                if batch.is_spec_v2 and batch_result.delay_sample_func is None:
-                    self.relayer.apply_spec_v2_relay_outputs(
-                        batch, handle, batch_result
-                    )
+                self.relayer.apply_outputs(batch, handle, batch_result)
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 batch.output_ids = batch_result.next_token_ids

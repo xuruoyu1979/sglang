@@ -238,12 +238,23 @@ class Relayer:
         if spec_need_hidden_states():
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
-    def handoff_to_next_iter(self, batch: ScheduleBatch, handle: RelayerHandle) -> None:
-        """Install -indices placeholder on output_ids; resolve_future fills
-        real tokens next iter. Spec V2 SB install is separate (see
-        apply_spec_v2_relay_outputs) since it requires the channel store first.
+    def apply_outputs(
+        self,
+        batch: ScheduleBatch,
+        handle: RelayerHandle,
+        batch_result: GenerationBatchResult,
+    ) -> None:
+        """Post-forward SB install for both non-spec and spec V2.
+        - output_ids: -indices placeholder; resolve_future fills next iter.
+        - spec V2 non-delay: also rebinds spec_info / seq_lens to channel views
+          (requires store() to have populated buffers first).
+
+        Delay-sample defers the spec V2 portion to apply_spec_v2_relay_outputs
+        from launch_batch_sample_if_needed after store() runs.
         """
         batch.output_ids = -handle.indices
+        if batch.is_spec_v2 and batch_result.delay_sample_func is None:
+            self.apply_spec_v2_relay_outputs(batch, handle, batch_result)
 
     def apply_pre_forward_decode_delta(self, batch: ScheduleBatch) -> None:
         """Overlap-mode non-spec pre-forward seq_lens bump + post-+1 readers.
