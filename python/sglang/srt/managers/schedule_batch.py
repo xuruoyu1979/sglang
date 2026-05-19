@@ -1489,8 +1489,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     spec_algorithm: SpeculativeAlgorithm = None
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
-    # Cross-iter relay handle for spec V2 overlap (slot in Relayer's channel
-    # buffers). Set by apply_spec_v2_relay_outputs; None for non-spec / spec V1.
+    # Spec V2 overlap: handle into Relayer channel slots. None otherwise.
     relayer_handle: Optional[RelayerHandle] = None
 
     # Whether to return hidden states
@@ -2344,18 +2343,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Post-alloc seq_lens update + post-+1 reads (hisparse / mamba) are
-        # owned by the scheduler-level dispatcher: overlap mode delegates to
-        # Relayer.apply_pre_forward_decode_delta; non-overlap calls
-        # apply_pre_forward_decode_delta directly. Kept out of prepare_for_decode
-        # so the Relayer can later swap the +1 implementation (e.g. channel
-        # store) without touching this method.
+        # +1 + post-+1 readers (hisparse / mamba) live in
+        # apply_pre_forward_decode_delta; scheduler dispatches there.
 
     def apply_pre_forward_decode_delta(self):
-        """Post-alloc pre-forward SB update for non-spec decode: bump seq_lens
-        / seq_lens_cpu / orig_seq_lens, then run post-+1 readers (hisparse
-        coordinator and mamba track buffers).
-        """
+        """Non-spec decode: +1 on seq_lens / seq_lens_cpu / orig_seq_lens
+        and run post-+1 readers (hisparse, mamba track buffers)."""
         bs = len(self.reqs)
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
@@ -2479,9 +2472,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
 
         if self.relayer_handle is not None:
-            # Spec V2 overlap: handle indices are the canonical state; spec_info
-            # tensor fields are channel views that will refresh next iter via
-            # resolve_future, so skip spec_info.filter_batch.
+            # Spec V2: handle is canonical; channel views refresh next iter.
             self.relayer_handle.indices = self.relayer_handle.indices[
                 keep_indices_device
             ]
@@ -2534,8 +2525,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.relayer_handle is not None:
-            # Spec V2 overlap: concat handle indices; spec_info tensor fields
-            # are channel views that will refresh next iter via resolve_future.
+            # Spec V2: concat handle; channel views refresh next iter.
             from sglang.srt.managers.overlap_utils import RelayerHandle
 
             assert other.relayer_handle is not None

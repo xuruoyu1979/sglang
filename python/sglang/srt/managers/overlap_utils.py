@@ -80,10 +80,9 @@ class Relayer:
             # This is to make the shape derivation easier.
             self.buf_initialized = False
 
-        # Producer event for spec V2 forward outputs. Recorded by
-        # store_for_new_batch on the producer (forward) stream; waited on by
-        # resolve_draft_input_for_handoff on the consumer (schedule) stream.
-        # Replaces the global verify_done barrier.
+        # Recorded after store_for_new_batch on forward stream; waited via
+        # event.wait on schedule stream in resolve_draft_input_for_handoff.
+        # Replaces the global verify_done CPU barrier.
         self._spec_v2_producer_event: Optional[torch.cuda.Event] = None
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
@@ -189,8 +188,8 @@ class Relayer:
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
 
-        # Record producer event on the current (forward) stream after the
-        # buf writes. Consumers wait this event before reading channel views.
+        # Producer event for spec V2 channel writes; consumers wait this
+        # before reading the slot views.
         event = torch.get_device_module(self.device).Event()
         event.record()
         self._spec_v2_producer_event = event
@@ -208,27 +207,21 @@ class Relayer:
     def resolve_draft_input_for_handoff(
         self, handle: RelayerHandle, draft_input: EagleDraftInput
     ):
-        """Rebind a spec V2 draft input's tensor fields to channel slot views
-        on the consumer (schedule) stream. The cross-stream sync against the
-        forward-stream producer is folded into the wait here, so downstream
-        SB.seq_lens / SB.spec_info reads on the schedule stream are properly
-        ordered without a global verify_done barrier.
+        """Rebind draft_input tensor fields to channel slot views on the
+        consumer (schedule) stream. event.wait folds in cross-stream sync;
+        downstream SB reads are then ordered without a verify_done barrier.
         """
         if handle is None or draft_input is None:
             return
         indices = handle.indices
-        # Idle / bs=0 batch: producer side (store_for_new_batch) skipped the
-        # write on the empty interval and did not record an event for the
-        # newly alloc'd slot. Worker-side idle tensors stay attached.
+        # Empty interval: producer skipped store and recorded no event;
+        # worker-side idle tensors stay attached.
         if indices.numel() == 0:
             return
         self._wait_spec_v2_producer()
-        # The old SB.relayer_handle holding `indices` loses its only Python
-        # ref when caller does `batch.relayer_handle = handle` after this
-        # returns; the caching allocator could reclaim the memory before the
-        # GPU finishes reading it on the current stream. Defer reclaim via
-        # record_stream until the RelayerHandle becomes a Relayer-owned ref
-        # (future work).
+        # Old SB.relayer_handle's only Python ref is dropped when caller
+        # rebinds; record_stream defers allocator reclaim until current
+        # stream's reads complete.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
         draft_input.topk_p = self.topk_p_buf[indices]
         draft_input.topk_index = self.topk_index_buf[indices]
@@ -238,20 +231,15 @@ class Relayer:
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
     def handoff_to_next_iter(self, batch: ScheduleBatch, handle: RelayerHandle) -> None:
-        """Install output_ids placeholder for next iter's scheduling prep.
-        Negated handle indices serve as the placeholder; resolve_future fills
-        in real tokens later on the forward stream. The spec V2 SB install
-        is done separately by apply_spec_v2_relay_outputs after the channel
-        store completes.
+        """Install -indices placeholder on output_ids; resolve_future fills
+        real tokens next iter. Spec V2 SB install is separate (see
+        apply_spec_v2_relay_outputs) since it requires the channel store first.
         """
         batch.output_ids = -handle.indices
 
     def apply_pre_forward_decode_delta(self, batch: ScheduleBatch) -> None:
-        """Owns overlap-mode non-spec pre-forward seq_lens update + post-+1
-        readers. spec V2 / V1 use other pre-forward paths (spec V2 lands its
-        seq_lens via apply_spec_v2_relay_outputs post-forward; spec V1 updates
-        inside the worker), so this is a noop for speculative algos.
-        """
+        """Overlap-mode non-spec pre-forward seq_lens bump + post-+1 readers.
+        Noop for spec algos (V2 updates seq_lens post-forward; V1 in worker)."""
         if not self.spec_algo.is_none():
             return
         batch.apply_pre_forward_decode_delta()
@@ -262,11 +250,9 @@ class Relayer:
         handle: RelayerHandle,
         batch_result: GenerationBatchResult,
     ) -> None:
-        """Install spec V2 worker output onto SB as channel-view-backed refs.
-        Caller must ensure store_for_new_batch has populated the channel
-        buffers; the cross-stream wait is folded into resolve_draft_input_for_handoff
-        so any subsequent SB-side read carries the producer event.wait inline.
-        """
+        """Install spec V2 outputs onto SB as channel-view-backed refs.
+        Caller must run store_for_new_batch first (event.wait is folded into
+        resolve_draft_input_for_handoff)."""
         batch.relayer_handle = handle
         draft_input: EagleDraftInput = batch_result.next_draft_input
         self.resolve_draft_input_for_handoff(handle, draft_input)

@@ -2788,12 +2788,9 @@ class Scheduler(
         return batch
 
     def _apply_pre_forward_decode_delta(self, batch: ScheduleBatch) -> None:
-        """Dispatch the post-alloc pre-forward decode update. For overlap
-        mode the Relayer owns it (so the implementation can later move to a
-        channel store / forward-stream producer without touching callers);
-        non-overlap calls into SB directly. Speculative algos handle their
-        own seq_lens update path and noop here.
-        """
+        """Dispatch post-alloc pre-forward decode update: overlap routes
+        through Relayer (so impl can later move to channel store); non-overlap
+        calls SB directly. Spec algos noop (own seq_lens path)."""
         if batch.spec_algorithm.is_speculative():
             return
         if self.enable_overlap and self.relayer is not None:
@@ -2908,11 +2905,8 @@ class Scheduler(
 
                 self.relayer.handoff_to_next_iter(batch, handle)
 
-                # Spec V2 SB install requires the channel buffers to have
-                # been populated by store(). Only invoke it in the non-delay
-                # branch here; the delay-sample branch defers store() to
-                # launch_batch_sample_if_needed, which then applies the
-                # outputs.
+                # Delay-sample defers store() to launch_batch_sample_if_needed,
+                # which then applies the spec V2 outputs.
                 if batch.is_spec_v2 and batch_result.delay_sample_func is None:
                     self.relayer.apply_spec_v2_relay_outputs(
                         batch, handle, batch_result
@@ -2998,10 +2992,8 @@ class Scheduler(
                 return_hidden_states=self.cur_batch.return_hidden_states,
             )
 
-        # Spec V2 SB install deferred from run_batch: store() just populated
-        # the channel buffers, so it is now safe to rebind SB.spec_info /
-        # SB.seq_lens to the channel views before the next iter's
-        # prepare_for_decode reads them.
+        # Spec V2 SB install deferred from run_batch (channel buffers were
+        # just populated by store() above).
         if self.cur_batch is not None and self.cur_batch.is_spec_v2:
             self.relayer.apply_spec_v2_relay_outputs(
                 self.cur_batch, batch_result.relayer_handle, batch_result
