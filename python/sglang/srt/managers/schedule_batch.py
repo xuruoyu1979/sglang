@@ -2340,7 +2340,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation
+        # Post-alloc seq_lens update + post-+1 reads (hisparse / mamba) are
+        # owned by the scheduler-level dispatcher: overlap mode delegates to
+        # Relayer.apply_pre_forward_decode_delta; non-overlap calls
+        # apply_pre_forward_decode_delta directly. Kept out of prepare_for_decode
+        # so the Relayer can later swap the +1 implementation (e.g. channel
+        # store) without touching this method.
+
+    def apply_pre_forward_decode_delta(self):
+        """Post-alloc pre-forward SB update for non-spec decode: bump seq_lens
+        / seq_lens_cpu / orig_seq_lens, then run post-+1 readers (hisparse
+        coordinator and mamba track buffers).
+        """
+        bs = len(self.reqs)
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.seq_lens = self.seq_lens + 1

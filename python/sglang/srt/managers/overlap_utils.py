@@ -244,6 +244,16 @@ class Relayer:
         """
         batch.output_ids = -handle.indices
 
+    def apply_pre_forward_decode_delta(self, batch: ScheduleBatch) -> None:
+        """Owns overlap-mode non-spec pre-forward seq_lens update + post-+1
+        readers. spec V2 / V1 use other pre-forward paths (spec V2 lands its
+        seq_lens via apply_spec_v2_relay_outputs post-forward; spec V1 updates
+        inside the worker), so this is a noop for speculative algos.
+        """
+        if not self.spec_algo.is_none():
+            return
+        batch.apply_pre_forward_decode_delta()
+
     def apply_spec_v2_relay_outputs(
         self,
         batch: ScheduleBatch,

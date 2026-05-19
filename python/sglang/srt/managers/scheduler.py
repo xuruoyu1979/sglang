@@ -2658,6 +2658,7 @@ class Scheduler(
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
+                self._apply_pre_forward_decode_delta(self.running_batch)
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
@@ -2783,7 +2784,22 @@ class Scheduler(
 
         # Update batch tensors
         batch.prepare_for_decode()
+        self._apply_pre_forward_decode_delta(batch)
         return batch
+
+    def _apply_pre_forward_decode_delta(self, batch: ScheduleBatch) -> None:
+        """Dispatch the post-alloc pre-forward decode update. For overlap
+        mode the Relayer owns it (so the implementation can later move to a
+        channel store / forward-stream producer without touching callers);
+        non-overlap calls into SB directly. Speculative algos handle their
+        own seq_lens update path and noop here.
+        """
+        if batch.spec_algorithm.is_speculative():
+            return
+        if self.enable_overlap and self.relayer is not None:
+            self.relayer.apply_pre_forward_decode_delta(batch)
+        else:
+            batch.apply_pre_forward_decode_delta()
 
     def record_batch_in_overlap(self, batch: ScheduleBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
