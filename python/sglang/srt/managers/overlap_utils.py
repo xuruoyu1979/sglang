@@ -88,13 +88,8 @@ class Relayer:
             self._verify_bufs_initialized = False
             self._draft_extend_bufs_initialized = False
 
-        # Recorded on forward stream by store_post_verify; awaited on
-        # schedule stream in resolve_draft_input_for_handoff so
-        # batch.seq_lens.cpu().item() in next iter's prepare_for_decode can
-        # overlap with the draft_extend that follows on forward stream.
-        # No event for draft_extend outputs: their channel views are
-        # consumed only on forward stream (resolve_future at next forward,
-        # same stream as the producer), so same-stream ordering suffices.
+        # Awaited on schedule stream in resolve_draft_input_for_handoff so
+        # seq_lens.cpu() can overlap with draft_extend.
         self._event_post_verify: Optional[torch.cuda.Event] = None
 
     def _lazy_init_verify_bufs(self, draft_input: EagleDraftInput):
@@ -174,11 +169,8 @@ class Relayer:
 
     def store(self, handle: RelayerHandle, batch_result: GenerationBatchResult):
         """Non-spec: write token_ids_buf. Spec V2: write the draft-extend
-        portion (topk_p / topk_index / hidden_states); the verify portion
-        (new_seq_lens / bonus_tokens) is written earlier by the worker via
-        store_post_verify so schedule-stream consumers can read it without
-        waiting for draft_extend.
-        """
+        portion; verify portion was stored earlier from worker.verify via
+        store_post_verify."""
         if self.spec_algo.is_none():
             intv = handle.interval
             if self.is_empty_slice(intv):
@@ -188,11 +180,8 @@ class Relayer:
             self.store_post_draft_extend(handle, batch_result.next_draft_input)
 
     def store_post_verify(self, handle: RelayerHandle, draft_input: EagleDraftInput):
-        """Called from inside worker.verify between sample and
-        _draft_extend_for_decode. Writes verify-phase outputs to channel and
-        records event_post_verify so schedule-stream consumers (the
-        .cpu()/.item() hot path on seq_lens) can overlap with draft_extend.
-        """
+        """Called from worker.verify between sample and draft_extend, so
+        seq_lens.cpu() at next prepare_for_decode can overlap with draft_extend."""
         intv = handle.interval
         if self.is_empty_slice(intv):
             return
@@ -207,9 +196,6 @@ class Relayer:
     def store_post_draft_extend(
         self, handle: RelayerHandle, draft_input: EagleDraftInput
     ):
-        """Writes draft-extend outputs to channel. No event needed: the
-        channel views are consumed on forward stream at next iter's
-        resolve_future, same stream as this write."""
         intv = handle.interval
         if self.is_empty_slice(intv):
             return
@@ -223,23 +209,17 @@ class Relayer:
     def resolve_draft_input_for_handoff(
         self, handle: RelayerHandle, draft_input: EagleDraftInput
     ):
-        """Rebind new_seq_lens to its channel slot on the consumer (schedule)
-        stream, waiting event_post_verify. Other fields (bonus_tokens /
-        topk_p / topk_index / hidden_states) are consumed only on forward
-        stream — resolve_future at next forward rebinds them in-place there
-        (same stream as the producer, no event needed).
-        """
+        """Rebind new_seq_lens to channel view for schedule-stream readers.
+        Other fields are forward-stream only; resolve_future at next forward
+        rebinds them same-stream (no event needed)."""
         if handle is None or draft_input is None:
             return
         indices = handle.indices
-        # Empty interval: producer skipped store and recorded no event;
-        # worker-side idle tensors stay attached.
+        # Empty interval: store was skipped, no event recorded.
         if indices.numel() == 0:
             return
         stream = torch.get_device_module(self.device).current_stream()
-        # Old SB.relayer_handle's only Python ref is dropped when caller
-        # rebinds; record_stream defers allocator reclaim until current
-        # stream's reads complete.
+        # Defer allocator reclaim of indices until current-stream reads done.
         indices.record_stream(stream)
         if self._event_post_verify is not None:
             self._event_post_verify.wait(stream)
