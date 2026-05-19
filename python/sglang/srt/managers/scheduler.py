@@ -1280,8 +1280,8 @@ class Scheduler(
 
         if use_mlx():
             # MLX overlap scheduling uses mx.async_eval / mx.eval for
-            # synchronisation so no CUDA/MPS streams or FutureMap needed.
-            self.future_map = None
+            # synchronisation so no CUDA/MPS streams or Relayer needed.
+            self.relayer = None
             # Empty result_queue is needed because idle-check references it
             # when enable_overlap is True.
             self.result_queue: Deque = deque()
@@ -1296,10 +1296,10 @@ class Scheduler(
         )
 
         if not self.enable_overlap:
-            self.future_map = None
+            self.relayer = None
             return
 
-        self.future_map = self.spec_algorithm.create_future_map(
+        self.relayer = self.spec_algorithm.create_relayer(
             self.max_running_requests,
             self.chunked_prefill_size,
             self.model_config.context_len,
@@ -2862,11 +2862,11 @@ class Scheduler(
             if self.enable_overlap:
                 with self._overlap_forward_isolation(batch):
                     bs = len(batch.seq_lens)
-                    future_indices = self.future_map.alloc_future_indices(bs)
+                    handle = self.relayer.alloc_handle(bs)
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
-                        self.future_map.resolve_future(batch)
+                        self.relayer.resolve_future(batch)
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(batch)
                         # Park any refs the worker wants kept alive 2 iters
@@ -2879,17 +2879,15 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self.future_map.store_to_map(future_indices, batch_result)
+                            self.relayer.store(handle, batch_result)
                             batch_result.copy_to_cpu(
                                 return_logprob=batch.return_logprob,
                                 return_hidden_states=batch.return_hidden_states,
                             )
                         else:
-                            batch_result.future_indices = future_indices
+                            batch_result.relayer_handle = handle
 
-                self.future_map.handoff_to_next_iter(
-                    batch, future_indices, batch_result
-                )
+                self.relayer.handoff_to_next_iter(batch, handle, batch_result)
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 batch.output_ids = batch_result.next_token_ids
@@ -2965,7 +2963,7 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            self.relayer.store(batch_result.relayer_handle, batch_result)
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,

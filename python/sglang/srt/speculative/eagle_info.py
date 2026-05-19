@@ -16,7 +16,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.overlap_utils import FutureIndices
+from sglang.srt.managers.overlap_utils import RelayerHandle
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
@@ -694,7 +694,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     num_tokens_for_logprob_per_req: int = -1
 
     # V2 overlap worker only
-    future_indices: Optional[FutureIndices] = None
+    relayer_handle: Optional[RelayerHandle] = None
     new_seq_lens: Optional[torch.Tensor] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
@@ -762,8 +762,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        if self.future_indices is not None:
-            self.future_indices.indices = self.future_indices.indices[new_indices]
+        if self.relayer_handle is not None:
+            self.relayer_handle.indices = self.relayer_handle.indices[new_indices]
             return
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
@@ -791,11 +791,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.bonus_tokens = self.bonus_tokens[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
-        if self.future_indices is not None:
-            assert spec_info.future_indices is not None
-            self.future_indices = FutureIndices(
+        if self.relayer_handle is not None:
+            assert spec_info.relayer_handle is not None
+            self.relayer_handle = RelayerHandle(
                 indices=torch.cat(
-                    [self.future_indices.indices, spec_info.future_indices.indices]
+                    [self.relayer_handle.indices, spec_info.relayer_handle.indices]
                 )
             )
             return

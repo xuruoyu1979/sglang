@@ -37,12 +37,12 @@ else:
 
 
 @dataclass
-class FutureIndices:
+class RelayerHandle:
     indices: torch.Tensor
     interval: Optional[slice] = None
 
 
-class FutureMap:
+class Relayer:
     def __init__(
         self,
         max_running_requests: int,
@@ -81,9 +81,9 @@ class FutureMap:
             self.buf_initialized = False
 
         # Producer event for spec V2 forward outputs. Recorded by
-        # store_to_map_for_new_batch on the producer (forward) stream;
-        # waited on by resolve_draft_input_for_handoff on the consumer
-        # (schedule) stream. Replaces the global verify_done barrier.
+        # store_for_new_batch on the producer (forward) stream; waited on by
+        # resolve_draft_input_for_handoff on the consumer (schedule) stream.
+        # Replaces the global verify_done barrier.
         self._spec_v2_producer_event: Optional[torch.cuda.Event] = None
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
@@ -124,25 +124,25 @@ class FutureMap:
                 device=self.device,
             )
 
-    def alloc_future_indices(self, bs: int) -> FutureIndices:
-        """Update the circular buffer pointer and allocate future indices."""
+    def alloc_handle(self, bs: int) -> RelayerHandle:
+        """Update the circular buffer pointer and allocate a relayer handle."""
         cur_future_ct = self.future_ct
         self.future_ct = (cur_future_ct + bs) % self.future_limit
         start = cur_future_ct + 1
         end = cur_future_ct + 1 + bs
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
-        return FutureIndices(indices=indices, interval=slice(start, end))
+        return RelayerHandle(indices=indices, interval=slice(start, end))
 
     def resolve_future(self, batch: ScheduleBatch):
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.token_ids_buf)
         else:
-            # TODO(lsyin): write future indices into spec_info.future_indices
+            # TODO(lsyin): write relayer handle into spec_info.relayer_handle
             draft_input: EagleDraftInput = batch.spec_info
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
-            indices = draft_input.future_indices.indices
+            indices = draft_input.relayer_handle.indices
             # The indices tensor was allocated on the default stream but is
             # used here on the forward stream. Meanwhile, the old spec_info
             # holding this tensor will lose all Python references (replaced at
@@ -163,23 +163,19 @@ class FutureMap:
         else:
             return start <= stop
 
-    def store_to_map(
-        self, future_indices: FutureIndices, batch_result: GenerationBatchResult
-    ):
+    def store(self, handle: RelayerHandle, batch_result: GenerationBatchResult):
         if self.spec_algo.is_none():
-            intv = future_indices.interval
+            intv = handle.interval
             if self.is_empty_slice(intv):
                 # idle indices in dp attention do not need store info
                 return
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, draft_input)
+            self.store_for_new_batch(handle, draft_input)
 
-    def store_to_map_for_new_batch(
-        self, future_indices: FutureIndices, draft_input: EagleDraftInput
-    ):
-        intv = future_indices.interval
+    def store_for_new_batch(self, handle: RelayerHandle, draft_input: EagleDraftInput):
+        intv = handle.interval
         if self.is_empty_slice(intv):
             # idle indices in dp attention do not need store info
             return
@@ -217,11 +213,11 @@ class FutureMap:
         SB.seq_lens / SB.spec_info reads on the schedule stream are properly
         ordered without a global verify_done barrier.
         """
-        if draft_input is None or draft_input.future_indices is None:
+        if draft_input is None or draft_input.relayer_handle is None:
             return
-        indices = draft_input.future_indices.indices
-        # Idle / bs=0 batch: producer side (store_to_map_for_new_batch) skipped
-        # the write on the empty interval and did not record an event for the
+        indices = draft_input.relayer_handle.indices
+        # Idle / bs=0 batch: producer side (store_for_new_batch) skipped the
+        # write on the empty interval and did not record an event for the
         # newly alloc'd slot. Worker-side idle tensors stay attached.
         if indices.numel() == 0:
             return
@@ -236,23 +232,23 @@ class FutureMap:
     def handoff_to_next_iter(
         self,
         batch: ScheduleBatch,
-        future_indices: FutureIndices,
+        handle: RelayerHandle,
         batch_result: GenerationBatchResult,
     ) -> None:
         """Install this iter's worker output onto SB for next iter's
         scheduling prep.
 
-        - output_ids: negated future indices as placeholder; resolve_future
+        - output_ids: negated handle indices as placeholder; resolve_future
           fills in real tokens later on the forward stream.
         - spec V2: eagerly resolve draft_input tensor fields to channel slot
           views (with the producer event.wait folded in), then install
           spec_info + seq_lens. Channel views are channel-buf backed so SB no
           longer aliases a worker-stream raw tensor.
         """
-        batch.output_ids = -future_indices.indices
+        batch.output_ids = -handle.indices
         if batch.is_spec_v2:
             draft_input: EagleDraftInput = batch_result.next_draft_input
-            draft_input.future_indices = future_indices
+            draft_input.relayer_handle = handle
             # Eager resolve on the schedule stream: rebind draft_input fields
             # from worker-stream raw tensors to channel slot views, folding in
             # the cross-stream wait. After this, SB.seq_lens / SB.spec_info

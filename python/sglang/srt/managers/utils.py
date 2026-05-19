@@ -10,7 +10,7 @@ import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.overlap_utils import FutureIndices
+from sglang.srt.managers.overlap_utils import RelayerHandle
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.server_args import ServerArgs
@@ -40,7 +40,7 @@ class GenerationBatchResult:
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
-    future_indices: Optional[FutureIndices] = None
+    relayer_handle: Optional[RelayerHandle] = None
     speculative_num_draft_tokens: Optional[int] = None
 
     # FIXME(lsyin): maybe move to a better place?
