@@ -2884,13 +2884,15 @@ class Scheduler(
                 with self._overlap_forward_isolation(batch):
                     bs = len(batch.seq_lens)
                     handle = self.relayer.alloc_handle(bs)
-                    # Set early: spec V2 worker reads batch.relayer_handle
-                    # in verify() to call store_post_verify.
-                    batch.relayer_handle = handle
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
+                        # resolve_future reads `batch.relayer_handle` (the
+                        # *previous* iter's handle) to rebind channel views;
+                        # switch to the new handle AFTER, so verify() picks
+                        # it up for store_post_verify.
                         self.relayer.resolve_future(batch)
+                        batch.relayer_handle = handle
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(batch)
                         # Park any refs the worker wants kept alive 2 iters
