@@ -1308,6 +1308,11 @@ class Scheduler(
             self.device,
             self.spec_algorithm,
         )
+        # Spec V2 workers store verify-phase outputs themselves (between
+        # verify and draft_extend) so schedule prep can overlap with
+        # draft_extend; give them a relayer ref.
+        if hasattr(self.model_worker, "relayer"):
+            self.model_worker.relayer = self.relayer
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -2879,6 +2884,9 @@ class Scheduler(
                 with self._overlap_forward_isolation(batch):
                     bs = len(batch.seq_lens)
                     handle = self.relayer.alloc_handle(bs)
+                    # Set early: spec V2 worker reads batch.relayer_handle
+                    # in verify() to call store_post_verify.
+                    batch.relayer_handle = handle
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)

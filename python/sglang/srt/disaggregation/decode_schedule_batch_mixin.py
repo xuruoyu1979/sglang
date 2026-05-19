@@ -179,5 +179,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
                 self.relayer_handle = relayer.alloc_handle(len(self.seq_lens))
-                relayer.store_for_new_batch(self.relayer_handle, spec_info)
+                relayer.store_post_verify(self.relayer_handle, spec_info)
+                relayer.store_post_draft_extend(self.relayer_handle, spec_info)
             self.spec_info = spec_info

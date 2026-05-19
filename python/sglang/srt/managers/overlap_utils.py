@@ -84,24 +84,37 @@ class Relayer:
                 (self.future_buffer_len,), dtype=torch.int64, device=self.device
             )
         else:
-            # For speculative decoding, we lazily initialize the buffers
-            # This is to make the shape derivation easier.
-            self.buf_initialized = False
+            # Spec V2: bufs are lazily inited per phase from first store.
+            self._verify_bufs_initialized = False
+            self._draft_extend_bufs_initialized = False
 
-        # Recorded after store_for_new_batch on forward stream; waited via
-        # event.wait on schedule stream in resolve_draft_input_for_handoff.
-        # Replaces the global verify_done CPU barrier.
-        self._spec_v2_producer_event: Optional[torch.cuda.Event] = None
+        # Two events split the spec V2 forward into verify and draft_extend
+        # phases. Recorded on forward stream by the respective store_post_*
+        # call; resolve_draft_input_for_handoff waits them per-field on
+        # schedule stream so schedule prep / .cpu().item() can overlap with
+        # draft_extend.
+        self._event_post_verify: Optional[torch.cuda.Event] = None
+        self._event_post_draft_extend: Optional[torch.cuda.Event] = None
 
-    def _lazy_init_buf(self, draft_input: EagleDraftInput):
-        self.buf_initialized = True
+    def _lazy_init_verify_bufs(self, draft_input: EagleDraftInput):
+        self._verify_bufs_initialized = True
+        new_seq_lens0 = draft_input.new_seq_lens[0]
+        bonus_token0 = draft_input.bonus_tokens[0]
+        self.new_seq_lens_buf = torch.empty(
+            (self.future_buffer_len, *new_seq_lens0.shape),
+            dtype=new_seq_lens0.dtype,
+            device=self.device,
+        )
+        self.bonus_tokens_buf = torch.empty(
+            (self.future_buffer_len, *bonus_token0.shape),
+            dtype=bonus_token0.dtype,
+            device=self.device,
+        )
 
-        # Get a reference for each tensor
+    def _lazy_init_draft_extend_bufs(self, draft_input: EagleDraftInput):
+        self._draft_extend_bufs_initialized = True
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        bonus_token0 = draft_input.bonus_tokens[0]
-        new_seq_lens0 = draft_input.new_seq_lens[0]
-
         self.topk_p_buf = torch.empty(
             (self.future_buffer_len, *topk_p0.shape),
             dtype=topk_p0.dtype,
@@ -112,17 +125,6 @@ class Relayer:
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.bonus_tokens_buf = torch.empty(
-            (self.future_buffer_len, *bonus_token0.shape),
-            dtype=bonus_token0.dtype,
-            device=self.device,
-        )
-        self.new_seq_lens_buf = torch.empty(
-            (self.future_buffer_len, *new_seq_lens0.shape),
-            dtype=new_seq_lens0.dtype,
-            device=self.device,
-        )
-
         if spec_need_hidden_states():
             hidden_states0 = draft_input.hidden_states[0]
             self.hidden_states_buf = torch.empty(
@@ -170,54 +172,60 @@ class Relayer:
             return start <= stop
 
     def store(self, handle: RelayerHandle, batch_result: GenerationBatchResult):
+        """Non-spec: write token_ids_buf. Spec V2: write the draft-extend
+        portion (topk_p / topk_index / hidden_states); the verify portion
+        (new_seq_lens / bonus_tokens) is written earlier by the worker via
+        store_post_verify so schedule-stream consumers can read it without
+        waiting for draft_extend.
+        """
         if self.spec_algo.is_none():
             intv = handle.interval
             if self.is_empty_slice(intv):
-                # idle indices in dp attention do not need store info
                 return
             self.token_ids_buf[intv] = batch_result.next_token_ids
         else:
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_for_new_batch(handle, draft_input)
+            self.store_post_draft_extend(handle, batch_result.next_draft_input)
 
-    def store_for_new_batch(self, handle: RelayerHandle, draft_input: EagleDraftInput):
+    def store_post_verify(self, handle: RelayerHandle, draft_input: EagleDraftInput):
+        """Called from inside worker.verify between sample and
+        _draft_extend_for_decode. Writes verify-phase outputs to channel and
+        records event_post_verify so schedule-stream consumers (the
+        .cpu()/.item() hot path on seq_lens) can overlap with draft_extend.
+        """
         intv = handle.interval
         if self.is_empty_slice(intv):
-            # idle indices in dp attention do not need store info
             return
-
-        if not self.buf_initialized:
-            self._lazy_init_buf(draft_input)
-
-        self.topk_p_buf[intv] = draft_input.topk_p
-        self.topk_index_buf[intv] = draft_input.topk_index
-        self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
+        if not self._verify_bufs_initialized:
+            self._lazy_init_verify_bufs(draft_input)
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
-        if spec_need_hidden_states():
-            self.hidden_states_buf[intv] = draft_input.hidden_states
-
-        # Producer event for spec V2 channel writes; consumers wait this
-        # before reading the slot views.
+        self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
         event = torch.get_device_module(self.device).Event()
         event.record()
-        self._spec_v2_producer_event = event
+        self._event_post_verify = event
 
-    def _wait_spec_v2_producer(
-        self, consumer_stream: Optional[torch.cuda.Stream] = None
+    def store_post_draft_extend(
+        self, handle: RelayerHandle, draft_input: EagleDraftInput
     ):
-        event = self._spec_v2_producer_event
-        if event is None:
+        intv = handle.interval
+        if self.is_empty_slice(intv):
             return
-        if consumer_stream is None:
-            consumer_stream = torch.get_device_module(self.device).current_stream()
-        event.wait(consumer_stream)
+        if not self._draft_extend_bufs_initialized:
+            self._lazy_init_draft_extend_bufs(draft_input)
+        self.topk_p_buf[intv] = draft_input.topk_p
+        self.topk_index_buf[intv] = draft_input.topk_index
+        if spec_need_hidden_states():
+            self.hidden_states_buf[intv] = draft_input.hidden_states
+        event = torch.get_device_module(self.device).Event()
+        event.record()
+        self._event_post_draft_extend = event
 
     def resolve_draft_input_for_handoff(
         self, handle: RelayerHandle, draft_input: EagleDraftInput
     ):
-        """Rebind draft_input tensor fields to channel slot views on the
-        consumer (schedule) stream. event.wait folds in cross-stream sync;
-        downstream SB reads are then ordered without a verify_done barrier.
+        """Rebind draft_input fields to channel slot views on the consumer
+        (schedule) stream. Verify outputs only wait event_post_verify so
+        .cpu()/.item() on new_seq_lens unblocks before draft_extend finishes;
+        draft-extend outputs wait the later event.
         """
         if handle is None or draft_input is None:
             return
@@ -226,15 +234,19 @@ class Relayer:
         # worker-side idle tensors stay attached.
         if indices.numel() == 0:
             return
-        self._wait_spec_v2_producer()
+        stream = torch.get_device_module(self.device).current_stream()
         # Old SB.relayer_handle's only Python ref is dropped when caller
         # rebinds; record_stream defers allocator reclaim until current
         # stream's reads complete.
-        indices.record_stream(torch.get_device_module(self.device).current_stream())
+        indices.record_stream(stream)
+        if self._event_post_verify is not None:
+            self._event_post_verify.wait(stream)
+        draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+        draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
+        if self._event_post_draft_extend is not None:
+            self._event_post_draft_extend.wait(stream)
         draft_input.topk_p = self.topk_p_buf[indices]
         draft_input.topk_index = self.topk_index_buf[indices]
-        draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
-        draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
         if spec_need_hidden_states():
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
@@ -267,9 +279,9 @@ class Relayer:
         batch_result: GenerationBatchResult,
     ) -> None:
         """Install spec V2 outputs onto SB as channel-view-backed refs.
-        Caller must run store_for_new_batch first (event.wait is folded into
-        resolve_draft_input_for_handoff)."""
-        batch.relayer_handle = handle
+        Caller must run store_post_verify (worker side) + store_post_draft_extend
+        first; per-event waits are folded into resolve_draft_input_for_handoff.
+        batch.relayer_handle is set by scheduler before forward."""
         draft_input: EagleDraftInput = batch_result.next_draft_input
         self.resolve_draft_input_for_handoff(handle, draft_input)
         batch.spec_info = draft_input

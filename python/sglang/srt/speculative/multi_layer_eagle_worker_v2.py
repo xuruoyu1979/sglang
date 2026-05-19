@@ -12,6 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
+from __future__ import annotations
+
 import contextlib
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -57,6 +59,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils.common import empty_context, fast_topk
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.overlap_utils import Relayer
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
@@ -629,6 +632,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # Set by scheduler.init_overlap so verify() can call store_post_verify
+        # between sample and _draft_extend_for_decode.
+        self.relayer: Optional[Relayer] = None
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -797,9 +803,16 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
         )
+
+        # Verify-phase outputs stored to channel before _draft_extend_for_decode
+        # so schedule-stream .cpu()/.item() on seq_lens can overlap with the
+        # draft extend that follows. See EAGLEWorkerV2.verify.
+        if self.relayer is not None and batch.relayer_handle is not None:
+            self.relayer.store_post_verify(batch.relayer_handle, next_draft_input)
+
         # verify_forward_batch transitively holds verify-time GPU tensors that
         # must outlive the imminent batch.input_ids rebind; scheduler pins it
-        # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.
+        # in batch_record_buf via extra_keep_alive_refs.
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
