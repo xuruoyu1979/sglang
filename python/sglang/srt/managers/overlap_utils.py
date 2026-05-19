@@ -194,10 +194,17 @@ class FutureMap:
         future_indices: FutureIndices,
         batch_result: GenerationBatchResult,
     ) -> None:
-        """Install spec V2 worker output onto SB for next iter's scheduling
-        prep. Caller guards spec V2.
+        """Install this iter's worker output onto SB for next iter's
+        scheduling prep. The output tensors are still being resolved on the
+        forward stream; resolve_future will fill in the real values later.
+
+        - output_ids: negated future indices as placeholder.
+        - spec V2: also rebind spec_info + seq_lens to future-map-backed
+          tensors.
         """
-        draft_input: EagleDraftInput = batch_result.next_draft_input
-        batch.spec_info = draft_input
-        batch.spec_info.future_indices = future_indices
-        batch.seq_lens = draft_input.new_seq_lens
+        batch.output_ids = -future_indices.indices
+        if batch.is_spec_v2:
+            draft_input: EagleDraftInput = batch_result.next_draft_input
+            batch.spec_info = draft_input
+            batch.spec_info.future_indices = future_indices
+            batch.seq_lens = draft_input.new_seq_lens

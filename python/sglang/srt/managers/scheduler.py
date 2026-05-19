@@ -2887,16 +2887,12 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                # FIXME(lsyin): move this assignment elsewhere
-                future_indices_or_next_token_ids = -future_indices.indices
-
-                if batch.is_spec_v2:
-                    self.future_map.handoff_to_next_iter(
-                        batch, future_indices, batch_result
-                    )
+                self.future_map.handoff_to_next_iter(
+                    batch, future_indices, batch_result
+                )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                future_indices_or_next_token_ids = batch_result.next_token_ids
+                batch.output_ids = batch_result.next_token_ids
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -2906,14 +2902,8 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                future_indices_or_next_token_ids = batch_result.next_token_ids
+                batch.output_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
-
-            # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
-            #       which can probably be replaced by future_indices later [TODO(lsyin)].
-            #       we shall still keep the original outputs, e.g. next_token_ids
-            #       in the GenerationBatchOutput for processing after copy_done.
-            batch.output_ids = future_indices_or_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
