@@ -222,6 +222,12 @@ class Relayer:
         if indices.numel() == 0:
             return
         self._wait_spec_v2_producer()
+        # The old spec_info holding `indices` loses its only Python ref when
+        # caller does `batch.spec_info = draft_input` after this returns; the
+        # caching allocator could reclaim the memory before the GPU finishes
+        # reading it on the current stream. Defer reclaim via record_stream
+        # until the RelayerHandle becomes a Relayer-owned ref (future work).
+        indices.record_stream(torch.get_device_module(self.device).current_stream())
         draft_input.topk_p = self.topk_p_buf[indices]
         draft_input.topk_index = self.topk_index_buf[indices]
         draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
@@ -229,30 +235,28 @@ class Relayer:
         if spec_need_hidden_states():
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
-    def handoff_to_next_iter(
+    def handoff_to_next_iter(self, batch: ScheduleBatch, handle: RelayerHandle) -> None:
+        """Install output_ids placeholder for next iter's scheduling prep.
+        Negated handle indices serve as the placeholder; resolve_future fills
+        in real tokens later on the forward stream. The spec V2 SB install
+        is done separately by apply_spec_v2_relay_outputs after the channel
+        store completes.
+        """
+        batch.output_ids = -handle.indices
+
+    def apply_spec_v2_relay_outputs(
         self,
         batch: ScheduleBatch,
         handle: RelayerHandle,
         batch_result: GenerationBatchResult,
     ) -> None:
-        """Install this iter's worker output onto SB for next iter's
-        scheduling prep.
-
-        - output_ids: negated handle indices as placeholder; resolve_future
-          fills in real tokens later on the forward stream.
-        - spec V2: eagerly resolve draft_input tensor fields to channel slot
-          views (with the producer event.wait folded in), then install
-          spec_info + seq_lens. Channel views are channel-buf backed so SB no
-          longer aliases a worker-stream raw tensor.
+        """Install spec V2 worker output onto SB as channel-view-backed refs.
+        Caller must ensure store_for_new_batch has populated the channel
+        buffers; the cross-stream wait is folded into resolve_draft_input_for_handoff
+        so any subsequent SB-side read carries the producer event.wait inline.
         """
-        batch.output_ids = -handle.indices
-        if batch.is_spec_v2:
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            draft_input.relayer_handle = handle
-            # Eager resolve on the schedule stream: rebind draft_input fields
-            # from worker-stream raw tensors to channel slot views, folding in
-            # the cross-stream wait. After this, SB.seq_lens / SB.spec_info
-            # refs are channel-backed (persistent buf, properly ordered).
-            self.resolve_draft_input_for_handoff(draft_input)
-            batch.spec_info = draft_input
-            batch.seq_lens = draft_input.new_seq_lens
+        draft_input: EagleDraftInput = batch_result.next_draft_input
+        draft_input.relayer_handle = handle
+        self.resolve_draft_input_for_handoff(draft_input)
+        batch.spec_info = draft_input
+        batch.seq_lens = draft_input.new_seq_lens

@@ -2887,7 +2887,17 @@ class Scheduler(
                         else:
                             batch_result.relayer_handle = handle
 
-                self.relayer.handoff_to_next_iter(batch, handle, batch_result)
+                self.relayer.handoff_to_next_iter(batch, handle)
+
+                # Spec V2 SB install requires the channel buffers to have
+                # been populated by store(). Only invoke it in the non-delay
+                # branch here; the delay-sample branch defers store() to
+                # launch_batch_sample_if_needed, which then applies the
+                # outputs.
+                if batch.is_spec_v2 and batch_result.delay_sample_func is None:
+                    self.relayer.apply_spec_v2_relay_outputs(
+                        batch, handle, batch_result
+                    )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 batch.output_ids = batch_result.next_token_ids
@@ -2967,6 +2977,15 @@ class Scheduler(
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
+            )
+
+        # Spec V2 SB install deferred from run_batch: store() just populated
+        # the channel buffers, so it is now safe to rebind SB.spec_info /
+        # SB.seq_lens to the channel views before the next iter's
+        # prepare_for_decode reads them.
+        if self.cur_batch is not None and self.cur_batch.is_spec_v2:
+            self.relayer.apply_spec_v2_relay_outputs(
+                self.cur_batch, batch_result.relayer_handle, batch_result
             )
 
         # Release the closure and large GPU tensors that are no longer needed.
