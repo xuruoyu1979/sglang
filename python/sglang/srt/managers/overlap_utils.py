@@ -245,14 +245,15 @@ class Relayer:
         batch_result: GenerationBatchResult,
     ) -> None:
         """Post-forward SB install for both non-spec and spec V2.
-        - output_ids: -indices placeholder; resolve_future fills next iter.
-        - spec V2 non-delay: also rebinds spec_info / seq_lens to channel views
-          (requires store() to have populated buffers first).
+        - input_ids: -indices placeholder for next iter; resolve_future
+          rewrites it in-place at next forward via token_ids_buf lookup.
+        - spec V2 non-delay: also rebinds spec_info / seq_lens to channel
+          views (requires store() to have populated buffers first).
 
         Delay-sample defers the spec V2 portion to apply_spec_v2_relay_outputs
         from launch_batch_sample_if_needed after store() runs.
         """
-        batch.output_ids = -handle.indices
+        batch.input_ids = -handle.indices
         if batch.is_spec_v2 and batch_result.delay_sample_func is None:
             self.apply_spec_v2_relay_outputs(batch, handle, batch_result)
 

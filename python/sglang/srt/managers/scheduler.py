@@ -2270,7 +2270,7 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        batch.output_ids = torch.tensor(
+        batch.input_ids = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
 
@@ -2906,7 +2906,7 @@ class Scheduler(
                 self.relayer.apply_outputs(batch, handle, batch_result)
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                batch.output_ids = batch_result.next_token_ids
+                batch.input_ids = batch_result.next_token_ids.to(torch.int64)
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
@@ -2916,7 +2916,7 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                batch.output_ids = batch_result.next_token_ids
+                batch.input_ids = batch_result.next_token_ids.to(torch.int64)
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
