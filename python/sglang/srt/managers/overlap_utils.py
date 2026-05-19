@@ -39,7 +39,15 @@ else:
 @dataclass
 class RelayerHandle:
     indices: torch.Tensor
+    # Contiguous slot range from alloc_handle; consumed by Relayer.store* via
+    # is_empty_slice. None after filter / merge (subset is not contiguous).
     interval: Optional[slice] = None
+
+    def filter(self, keep_indices: torch.Tensor) -> "RelayerHandle":
+        return RelayerHandle(indices=self.indices[keep_indices])
+
+    def merge(self, other: "RelayerHandle") -> "RelayerHandle":
+        return RelayerHandle(indices=torch.cat([self.indices, other.indices]))
 
 
 class Relayer:

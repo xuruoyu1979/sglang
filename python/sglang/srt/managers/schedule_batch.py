@@ -2473,9 +2473,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.relayer_handle is not None:
             # Spec V2: handle is canonical; channel views refresh next iter.
-            self.relayer_handle.indices = self.relayer_handle.indices[
-                keep_indices_device
-            ]
+            self.relayer_handle = self.relayer_handle.filter(keep_indices_device)
         elif self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
@@ -2526,14 +2524,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.relayer_handle is not None:
             # Spec V2: concat handle; channel views refresh next iter.
-            from sglang.srt.managers.overlap_utils import RelayerHandle
-
             assert other.relayer_handle is not None
-            self.relayer_handle = RelayerHandle(
-                indices=torch.cat(
-                    [self.relayer_handle.indices, other.relayer_handle.indices]
-                )
-            )
+            self.relayer_handle = self.relayer_handle.merge(other.relayer_handle)
         elif self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
