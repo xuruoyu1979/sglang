@@ -236,7 +236,9 @@ if _is_musa:
     try:
         from mate import moe_fused_gate
     except ImportError:
-        raise ImportError("mate is required for the biased grouped topk.")
+        # M1000 (mp_22) does not ship the mate stack; fall back to the
+        # pure-PyTorch biased grouped topk below.
+        moe_fused_gate = None
 
     from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
 
@@ -1881,7 +1883,7 @@ def biased_grouped_topk_gpu(
             scaling,
         )
         return topk_weights, topk_ids
-    elif _is_musa and (
+    elif _is_musa and moe_fused_gate is not None and (
         gating_output.shape[1] // num_expert_group <= 32
         or (num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384})
     ):

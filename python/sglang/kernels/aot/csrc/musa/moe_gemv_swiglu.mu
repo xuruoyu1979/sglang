@@ -68,6 +68,12 @@ using namespace musa::dnn;
     } \
     return;
 
+#ifndef ENABLE_FP8
+// FP8 e4m3 intrinsics (e.g. __musa_e4m32f16_rn_bst4) require mp_31 (arch >= 300).
+// On mp_22 the runtime guard below rejects FP8 inputs, so skip instantiating
+// the FP8 kernel templates entirely to avoid unsupported intrinsics.
+#define RUN_SCALE_ROUTE_FP8(...) TORCH_CHECK(false, "moe gemv fp8 not compiled on this arch")
+#else
 #define RUN_SCALE_ROUTE_FP8(_ADTYPE, _BDTYPE, _CDTYPE, _TOPK_WEIGHT_DTYPE, _SCALE_DTYPE, _IS_FP8) \
     if (mul_routed_weight) { \
         if (use_swigelu) { \
@@ -86,6 +92,7 @@ using namespace musa::dnn;
             CAL_MOE_GEMV_FP8(_ADTYPE, _BDTYPE, _CDTYPE, _TOPK_WEIGHT_DTYPE, _SCALE_DTYPE, false, false, _IS_FP8, false) \
         } \
     }
+#endif // ENABLE_FP8
 
 #define CAL_MOE_GEMV_W4A16(_ADTYPE, _BDTYPE, _TOPK_WEIGHT_DTYPE, _SCALE_DTYPE, _IS_MUL_ROUTED_WEIGHT, _IS_SWGELU, _IS_RMS_NROM) \
     if (is_pergroup_scale) { \
